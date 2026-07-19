@@ -1,0 +1,17 @@
+# outputs & artifacts (live on /u/ad11/scratch, symlinked here)
+results
+runs
+models
+*.out
+*.err
+slurm/*.out
+slurm/*.err
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# misc
+*.log
+videos/
