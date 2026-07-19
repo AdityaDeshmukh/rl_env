@@ -54,11 +54,12 @@ class Cfg:
     # shared regularizer (improvement knob): entropy bonus to avoid collapse/dead groups
     ent_coef: float = 0.0
     # exploration
-    sampling: str = "onpolicy"          # onpolicy | rrebel
+    sampling: str = "onpolicy"          # onpolicy | temp | eps | topm | mixed | elite | adaptive | rrebel(=mixed)
     temp_lo: float = 0.7
     temp_hi: float = 1.3
-    eps_max: float = 0.0
-    topm_max: int = 0
+    eps_max: float = 0.25
+    topm_max: int = 2
+    elite_pool: int = 64                # elite mode: number of start states cycled
     # eval / logging / io
     eval_every: int = 5                  # updates
     eval_episodes: int = 20
@@ -115,6 +116,11 @@ def train(cfg: Cfg):
     curve = []
     global_step, update, best_eval = 0, 0, -1e18
     t0 = time.time()
+    # elite-archive exploration state: fixed pool of start-state seeds + best
+    # trajectory (return, actions) seen from each. Deterministic dynamics =>
+    # replaying the actions from the same seed reproduces the trajectory exactly.
+    elite_seeds = [int(s) for s in np.random.RandomState(cfg.seed).randint(0, 2**31 - 1, cfg.elite_pool)]
+    archive = {}
 
     while global_step < cfg.total_timesteps:
         update += 1
@@ -130,21 +136,45 @@ def train(cfg: Cfg):
 
         losses, ents = [], []
         for _g in range(cfg.groups_per_update):
-            base_seed = int(np.random.randint(0, 2**31 - 1))
-            if vec_envs is not None:
-                returns, step_logps, ref_logp_sum, lengths, ent = rollout_group_vec(
-                    actor, rollout_ref, vec_envs, base_seed, meta, device, max_ep_len,
-                    sampling=cfg.sampling, temp_lo=cfg.temp_lo, temp_hi=cfg.temp_hi,
-                    eps_max=cfg.eps_max, topm_max=cfg.topm_max)
+            # elite mode cycles a fixed pool of start states so past trajectories
+            # from the same x can be replayed (Remark 1: any sampling dist is valid)
+            if cfg.sampling == "elite":
+                base_seed = elite_seeds[(update * cfg.groups_per_update + _g) % cfg.elite_pool]
+                forced = archive[base_seed]["actions"] if base_seed in archive else None
+                mode = "onpolicy"
             else:
+                base_seed = int(np.random.randint(0, 2**31 - 1))
+                forced = None
+                mode = "onpolicy" if cfg.sampling == "adaptive" else cfg.sampling
+
+            def _roll(mode_, forced_):
+                if vec_envs is not None:
+                    return rollout_group_vec(
+                        actor, rollout_ref, vec_envs, base_seed, meta, device, max_ep_len,
+                        sampling=mode_, temp_lo=cfg.temp_lo, temp_hi=cfg.temp_hi,
+                        eps_max=cfg.eps_max, topm_max=cfg.topm_max, forced_actions=forced_)
                 envs, base_obs = make_clones(cfg.env_id, cfg.G, base_seed)
-                returns, step_logps, ref_logp_sum, lengths, ent = rollout_group(
+                out = rollout_group(
                     actor, rollout_ref, envs, base_obs, meta, device, max_ep_len,
-                    sampling=cfg.sampling, temp_lo=cfg.temp_lo, temp_hi=cfg.temp_hi,
-                    eps_max=cfg.eps_max, topm_max=cfg.topm_max)
+                    sampling=mode_, temp_lo=cfg.temp_lo, temp_hi=cfg.temp_hi,
+                    eps_max=cfg.eps_max, topm_max=cfg.topm_max, forced_actions=forced_)
                 for e in envs:
                     e.close()
+                return out
+
+            returns, step_logps, ref_logp_sum, lengths, ent, acts = _roll(mode, forced)
             global_step += int(lengths.sum().item())
+            # adaptive: on a dead group (all returns tie -> zero pairwise signal),
+            # re-roll once with strong mixed perturbation
+            if cfg.sampling == "adaptive" and returns.std().item() < 1e-6:
+                returns, step_logps, ref_logp_sum, lengths, ent, acts = _roll("mixed", None)
+                global_step += int(lengths.sum().item())
+            # elite: archive the best trajectory seen from this start state
+            if cfg.sampling == "elite":
+                bi = int(returns.argmax().item())
+                br = float(returns[bi].item())
+                if base_seed not in archive or br > archive[base_seed]["ret"]:
+                    archive[base_seed] = {"ret": br, "actions": list(acts[bi])}
             ents.append(ent)
 
             if cfg.algo == "rrebel":
