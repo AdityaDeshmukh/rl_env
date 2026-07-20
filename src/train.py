@@ -141,23 +141,26 @@ def train(cfg: Cfg):
             if cfg.sampling == "elite":
                 base_seed = elite_seeds[(update * cfg.groups_per_update + _g) % cfg.elite_pool]
                 forced = archive[base_seed]["actions"] if base_seed in archive else None
-                mode = "onpolicy"
             else:
                 base_seed = int(np.random.randint(0, 2**31 - 1))
                 forced = None
-                mode = "onpolicy" if cfg.sampling == "adaptive" else cfg.sampling
+            # elite/adaptive are group-level strategies layered on on-policy sampling;
+            # temp/eps/topm/mixed are per-member perturbation distributions.
+            mode = "onpolicy" if cfg.sampling in ("elite", "adaptive") else cfg.sampling
 
             def _roll(mode_, forced_):
                 if vec_envs is not None:
                     return rollout_group_vec(
                         actor, rollout_ref, vec_envs, base_seed, meta, device, max_ep_len,
                         sampling=mode_, temp_lo=cfg.temp_lo, temp_hi=cfg.temp_hi,
-                        eps_max=cfg.eps_max, topm_max=cfg.topm_max, forced_actions=forced_)
+                        eps_max=cfg.eps_max, topm_max=cfg.topm_max, forced_actions=forced_,
+                        need_entropy=cfg.ent_coef > 0)
                 envs, base_obs = make_clones(cfg.env_id, cfg.G, base_seed)
                 out = rollout_group(
                     actor, rollout_ref, envs, base_obs, meta, device, max_ep_len,
                     sampling=mode_, temp_lo=cfg.temp_lo, temp_hi=cfg.temp_hi,
-                    eps_max=cfg.eps_max, topm_max=cfg.topm_max, forced_actions=forced_)
+                    eps_max=cfg.eps_max, topm_max=cfg.topm_max, forced_actions=forced_,
+                    need_entropy=cfg.ent_coef > 0)
                 for e in envs:
                     e.close()
                 return out

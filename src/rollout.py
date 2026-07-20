@@ -36,9 +36,8 @@ def _stack_tensor(obs_list, kind, device):
 
 
 def _perturb_params(sampling, G, temp_lo, temp_hi, eps_max, topm_max):
-    """Per-member (temperature, epsilon, top-m) vectors for a sampling mode."""
-    if sampling == "rrebel":                       # legacy alias
-        sampling = "mixed"
+    """Per-member (temperature, epsilon, top-m) vectors, plus a `perturbed` flag so
+    the hot loop can skip the whole perturbed-sampling path in the common case."""
     idx = np.arange(G)
     ramp = idx / max(1, G - 1)
     temp = np.ones(G)
@@ -50,29 +49,53 @@ def _perturb_params(sampling, G, temp_lo, temp_hi, eps_max, topm_max):
         eps = eps_max * ramp
     if sampling in ("topm", "mixed") and topm_max > 0:
         m = [int(np.random.randint(0, min(topm_max, i // 4) + 1)) for i in idx]
-    return temp, eps, m
+    perturbed = bool(np.any(temp != 1.0) or np.any(eps != 0.0) or any(m))
+    return temp, eps, m, perturbed
 
 
-def _sample_actions(logits, policy, temp_t, eps_t, mvec, A):
-    """Sample from the (possibly perturbed) distribution; grad-free."""
+def _sample_actions(logits, temp_t, eps_t, mvec, A):
+    """Sample from the perturbed distribution (grad-free). Only called when at least
+    one member is perturbed; on-policy sampling uses `policy.sample()` directly."""
     samp_logits = logits.detach() / temp_t
-    for i in range(samp_logits.shape[0]):
-        if mvec[i] > 0:
-            topk = torch.topk(samp_logits[i], k=min(mvec[i], A - 1))
-            samp_logits[i, topk.indices] = float("-inf")
+    if any(mvec):
+        for i in range(len(mvec)):
+            if mvec[i] > 0:
+                topk = torch.topk(samp_logits[i], k=min(mvec[i], A - 1))
+                samp_logits[i, topk.indices] = float("-inf")
     probs = torch.softmax(samp_logits, dim=-1)
     probs = (1.0 - eps_t) * probs + eps_t / A
     return D.Categorical(probs=probs).sample()
 
 
+def _force_member0(actions, forced_actions, step, active0):
+    """Elite replay: overwrite member 0's action with the archived one (if active)."""
+    if forced_actions is not None and active0 and step < len(forced_actions):
+        actions = actions.clone()
+        actions[0] = int(forced_actions[step])
+    return actions
+
+
+def _ref_logp(ref_actor, obs_t, actions, logp):
+    """log pi_ref(a|s): the frozen reference, or the detached current logp when None."""
+    if ref_actor is None:
+        return logp.detach()
+    with torch.no_grad():
+        return D.Categorical(logits=ref_actor(obs_t)).log_prob(actions)
+
+
+def _reduce_entropy(entropies, device):
+    return torch.stack(entropies).mean() if entropies else torch.zeros((), device=device)
+
+
 def rollout_group(actor, ref_actor, envs, base_obs, meta, device, max_ep_len,
                   sampling="onpolicy", temp_lo=0.7, temp_hi=1.3,
-                  eps_max=0.0, topm_max=0, forced_actions=None):
+                  eps_max=0.0, topm_max=0, forced_actions=None, need_entropy=True):
     """
     ref_actor: a frozen reference network, OR None (ref logp = detached current
       logp; exact for ref_mode='iter').
     forced_actions: optional int list — member 0 executes these actions verbatim
       (elite replay); its log-probs are still recorded under pi_theta.
+    need_entropy: compute the entropy bonus term (skip when ent_coef == 0).
 
     Returns: returns[G] (no grad), step_logps (G lists of grad scalars),
              ref_logp_sum[G] (no grad), lengths[G], ent (scalar, grad),
@@ -88,7 +111,7 @@ def rollout_group(actor, ref_actor, envs, base_obs, meta, device, max_ep_len,
     actions_out = [[] for _ in range(G)]
     entropies = []
 
-    temp, eps, mvec = _perturb_params(sampling, G, temp_lo, temp_hi, eps_max, topm_max)
+    temp, eps, mvec, perturbed = _perturb_params(sampling, G, temp_lo, temp_hi, eps_max, topm_max)
     temp_t = torch.as_tensor(temp, dtype=torch.float32, device=device).unsqueeze(1)
     eps_t = torch.as_tensor(eps, dtype=torch.float32, device=device).unsqueeze(1)
 
@@ -101,25 +124,20 @@ def rollout_group(actor, ref_actor, envs, base_obs, meta, device, max_ep_len,
         obs_t = _stack_tensor(obs_list, kind, device)               # (G, ...)
         logits = actor(obs_t)                                        # (G, A), grad
         policy = D.Categorical(logits=logits)
-        actions = _sample_actions(logits, policy, temp_t, eps_t, mvec, A)
-        if forced_actions is not None and step < len(forced_actions) and not done[0]:
-            actions = actions.clone()
-            actions[0] = int(forced_actions[step])
+        actions = _sample_actions(logits, temp_t, eps_t, mvec, A) if perturbed else policy.sample()
+        actions = _force_member0(actions, forced_actions, step, not done[0])
 
         logp = policy.log_prob(actions)                             # (G,), grad
-        ent = policy.entropy()
-        if ref_actor is None:
-            ref_logp = logp.detach()
-        else:
-            with torch.no_grad():
-                ref_logp = D.Categorical(logits=ref_actor(obs_t)).log_prob(actions)
+        ref_logp = _ref_logp(ref_actor, obs_t, actions, logp)
+        ent = policy.entropy() if need_entropy else None
 
         for i in range(G):
             if done[i]:
                 continue
             step_logps[i].append(logp[i])
             actions_out[i].append(int(actions[i].item()))
-            entropies.append(ent[i])
+            if need_entropy:
+                entropies.append(ent[i])
             ref_logp_sum[i] = ref_logp_sum[i] + ref_logp[i]
             obs, r, terminated, truncated, _ = envs[i].step(int(actions[i].item()))
             returns[i] += float(r)
@@ -129,7 +147,7 @@ def rollout_group(actor, ref_actor, envs, base_obs, meta, device, max_ep_len,
             else:
                 obs_list[i] = prep_obs(obs, kind)
 
-    ent_mean = torch.stack(entropies).mean() if entropies else torch.zeros((), device=device)
+    ent_mean = _reduce_entropy(entropies, device)
     return returns, step_logps, ref_logp_sum, lengths, ent_mean, actions_out
 
 
@@ -143,7 +161,7 @@ def _prep_batch(obs, kind):
 
 def rollout_group_vec(actor, ref_actor, vec_envs, base_seed, meta, device, max_ep_len,
                       sampling="onpolicy", temp_lo=0.7, temp_hi=1.3, eps_max=0.0,
-                      topm_max=0, forced_actions=None):
+                      topm_max=0, forced_actions=None, need_entropy=True):
     """Same semantics as rollout_group over a PERSISTENT vector env, reset with a
     shared seed so all G members start from the identical state x. Each env runs
     exactly ONE trajectory (autoreset NEXT_STEP + done-mask)."""
@@ -161,7 +179,7 @@ def rollout_group_vec(actor, ref_actor, vec_envs, base_seed, meta, device, max_e
     entropies = []
     active = np.ones(G, dtype=bool)
 
-    temp, eps, mvec = _perturb_params(sampling, G, temp_lo, temp_hi, eps_max, topm_max)
+    temp, eps, mvec, perturbed = _perturb_params(sampling, G, temp_lo, temp_hi, eps_max, topm_max)
     temp_t = torch.as_tensor(temp, dtype=torch.float32, device=device).unsqueeze(1)
     eps_t = torch.as_tensor(eps, dtype=torch.float32, device=device).unsqueeze(1)
 
@@ -174,30 +192,25 @@ def rollout_group_vec(actor, ref_actor, vec_envs, base_seed, meta, device, max_e
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
         logits = actor(obs_t)                                   # (G, A), grad
         policy = D.Categorical(logits=logits)
-        actions = _sample_actions(logits, policy, temp_t, eps_t, mvec, A)
-        if forced_actions is not None and step < len(forced_actions) and active[0]:
-            actions = actions.clone()
-            actions[0] = int(forced_actions[step])
+        actions = _sample_actions(logits, temp_t, eps_t, mvec, A) if perturbed else policy.sample()
+        actions = _force_member0(actions, forced_actions, step, active[0])
 
         logp = policy.log_prob(actions)
-        ent = policy.entropy()
-        if ref_actor is None:
-            ref_logp = logp.detach()
-        else:
-            with torch.no_grad():
-                ref_logp = D.Categorical(logits=ref_actor(obs_t)).log_prob(actions)
+        ref_logp = _ref_logp(ref_actor, obs_t, actions, logp)
+        ent = policy.entropy() if need_entropy else None
 
         obs_next, rew, term, trunc, _ = vec_envs.step(actions.cpu().numpy())
         done = np.logical_or(term, trunc)
         for i in np.nonzero(active)[0]:
             step_logps[i].append(logp[i])
             actions_out[i].append(int(actions[i].item()))
-            entropies.append(ent[i])
+            if need_entropy:
+                entropies.append(ent[i])
             ref_logp_sum[i] = ref_logp_sum[i] + ref_logp[i]
             returns[i] += float(rew[i])
             lengths[i] += 1
         active = active & ~done
         obs = _prep_batch(obs_next, kind)
 
-    ent_mean = torch.stack(entropies).mean() if entropies else torch.zeros((), device=device)
+    ent_mean = _reduce_entropy(entropies, device)
     return returns, step_logps, ref_logp_sum, lengths, ent_mean, actions_out
