@@ -1,0 +1,68 @@
+[
+ {
+  "env_id": "ALE/Breakout-v5",
+  "num_envs": 12,
+  "total_timesteps": 3000000,
+  "seed": 3,
+  "critic_ckpt": "models/Breakout__ppoTRAIN.pth",
+  "actor_loss": "rrebel",
+  "d_kind": "huber",
+  "outdir": "results/atari_critic",
+  "tag": "Breakout__rrebel_critic__s3"
+ },
+ {
+  "env_id": "ALE/Breakout-v5",
+  "num_envs": 12,
+  "total_timesteps": 3000000,
+  "seed": 3,
+  "critic_ckpt": "models/Breakout__ppoTRAIN.pth",
+  "actor_loss": "ppo",
+  "d_kind": "huber",
+  "outdir": "results/atari_critic",
+  "tag": "Breakout__grpo_critic__s3"
+ },
+ {
+  "env_id": "ALE/SpaceInvaders-v5",
+  "num_envs": 12,
+  "total_timesteps": 3000000,
+  "seed": 2,
+  "critic_ckpt": "models/SpaceInvaders__ppoTRAIN.pth",
+  "actor_loss": "rrebel",
+  "d_kind": "huber",
+  "outdir": "results/atari_critic",
+  "tag": "SpaceInvaders__rrebel_critic__s2"
+ },
+ {
+  "env_id": "ALE/SpaceInvaders-v5",
+  "num_envs": 12,
+  "total_timesteps": 3000000,
+  "seed": 2,
+  "critic_ckpt": "models/SpaceInvaders__ppoTRAIN.pth",
+  "actor_loss": "ppo",
+  "d_kind": "huber",
+  "outdir": "results/atari_critic",
+  "tag": "SpaceInvaders__grpo_critic__s2"
+ },
+ {
+  "env_id": "ALE/SpaceInvaders-v5",
+  "num_envs": 12,
+  "total_timesteps": 3000000,
+  "seed": 3,
+  "critic_ckpt": "models/SpaceInvaders__ppoTRAIN.pth",
+  "actor_loss": "rrebel",
+  "d_kind": "huber",
+  "outdir": "results/atari_critic",
+  "tag": "SpaceInvaders__rrebel_critic__s3"
+ },
+ {
+  "env_id": "ALE/SpaceInvaders-v5",
+  "num_envs": 12,
+  "total_timesteps": 3000000,
+  "seed": 3,
+  "critic_ckpt": "models/SpaceInvaders__ppoTRAIN.pth",
+  "actor_loss": "ppo",
+  "d_kind": "huber",
+  "outdir": "results/atari_critic",
+  "tag": "SpaceInvaders__grpo_critic__s3"
+ }
+]
